@@ -1,0 +1,91 @@
+# Azure Pipeline for Compiling, Packaging (RPM), and Releasing Firefox
+
+trigger:
+- main # This pipeline will run on commits to the 'main' branch
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  # The name of your GitHub service connection in Azure DevOps
+  gitHubConnectionName: 'MyGitHubConnection' # <-- IMPORTANT: CHANGE THIS
+  # Disabling telemetry in the build process itself
+  MOZ_TELEMETRY_ON_BUILD: 0
+
+jobs:
+- job: BuildAndReleaseFirefox
+  displayName: 'Compile, Package & Release Firefox'
+  timeoutInMinutes: 360 # 6 hours
+
+  steps:
+  - checkout: self
+    fetchDepth: 1
+    displayName: '1. Checkout Firefox Source Code (Shallow)'
+
+  - task: Cache@2
+    displayName: '2. Cache ~/.mozbuild dependencies'
+    inputs:
+      key: 'mozbuild | $(Agent.OS)'
+      path: '~/.mozbuild'
+
+  - script: |
+      # The bootstrap process needs base libraries.
+      # We also add the 'rpm' package, which is required to build an RPM file.
+      sudo apt-get update
+      sudo apt-get install -y python3-pip libdbus-glib-1-dev rpm
+    displayName: '3. Install Base System & RPM Dependencies'
+
+  - script: |
+      ./mach bootstrap --no-interactive --application-choice=browser
+    displayName: '4. Bootstrap Firefox Build Environment'
+
+  - script: |
+      # Create the build configuration file.
+      echo "ac_add_options --enable-release" >> .mozconfig
+      echo "ac_add_options --disable-debug" >> .mozconfig
+      echo "ac_add_options --disable-tests" >> .mozconfig
+      echo "ac_add_options --disable-telemetry" >> .mozconfig
+
+      echo "--- .mozconfig created ---"
+      cat .mozconfig
+      echo "--------------------------"
+    displayName: '5. Create .mozconfig Build Configuration'
+
+  - script: |
+      # Main compilation step.
+      ./mach build
+    displayName: '6. Build Firefox (this will take a long time)'
+
+  - script: |
+      # This creates a distributable RPM package.
+      ./mach package --format rpm
+    displayName: '7. Package the build as an RPM'
+
+  - task: PublishBuildArtifacts@1
+    displayName: '8. Publish RPM as a Build Artifact'
+    inputs:
+      PathtoPublish: '$(Build.SourcesDirectory)/obj-*/dist'
+      ArtifactName: 'firefox-rpm'
+      publishLocation: 'Container'
+
+  # This final task creates the GitHub Release.
+  - task: GitHubRelease@1
+    displayName: '9. Create GitHub Release'
+    # This condition ensures releases are only created for the main branch, not for feature branches.
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    inputs:
+      # The service connection you created earlier.
+      gitHubConnection: $(gitHubConnectionName)
+      # The name of your repo, e.g., 'your-username/gecko-dev'.
+      repositoryName: '$(Build.Repository.Name)'
+      action: 'create'
+      # The release will be based on the commit that triggered the build.
+      target: '$(Build.SourceVersion)'
+      # The tag for the release. Using the build number makes it unique.
+      tag: 'release-$(Build.BuildNumber)'
+      releaseNotesSource: 'inline'
+      releaseNotesInline: 'Automated Firefox build from Azure Pipelines. Build ID: $(Build.BuildNumber)'
+      # This is a good practice for automated builds.
+      isPreRelease: true
+      # Path to the asset(s) to upload. The wildcard finds the generated RPM file.
+      assets: '$(Build.SourcesDirectory)/obj-*/dist/*.rpm'
